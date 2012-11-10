@@ -1,38 +1,54 @@
 #!/usr/bin/env bash
 
 # Atomic Rsync
-# Remote Rsync backups with LVM snapshot.
+# Remote Rsync with automatic LVM snapshot.
 # Andrew Cutler 2012 Adlibre Pty Ltd
-# v0.1
+# v0.2.x
 
 #
-# Install via an SSH forced command. If using a non root user, then sudo is required: 
-# atomic  ALL=NOPASSWD: /usr/bin/rsync, /usr/local/bin/atomic.sh
-# Make sure requiretty is off
-#
-# Add to authorized_keys:
+# Install via an SSH forced command. Add to authorized_keys:
+# .... ~atomic/.ssh/authorized_keys
 # command="/usr/bin/sudo /usr/local/bin/atomic.sh $SSH_ORIGINAL_COMMAND" ssh-dss AAAAB....
+# ....
+# If using a non root user, then sudo might be required. eg:
+# .... /etc/sudoers
+# atomic  ALL=NOPASSWD: /usr/bin/rsync, /usr/local/bin/atomic.sh
+# ....
+# NB Make sure requiretty is off
 #
 
 #
 # Limitations: 
-#  * Exclusions don't currently work. Due to ordering of commands. (should be possible to get to work but need to check they are rooted in the snapshot point not the fs root.)
-#  * Multiple paths not yet supported in a single run
+#  * Multiple src paths not yet supported in a single run
+#  * Exclusions might not work de to ordering of commands. (should be possible to get to work but need to check they are rooted in the snapshot point not the fs root.)
 #
 
 # TODO: 
-#  * Make this smarter so a single backup of / will automatically snapshot all LVM mounted filesystems in the path and return the filelist to rsync
+#  * Error handling / checking that we have enough snapshotspace
 
-# CONFIGURATION
-RSYNC_ARGS=`shift; echo "$@"`
-BACKUPPATH=`echo "${RSYNC_ARGS}" | sed 's/.* //'` # last argument
+# DEFAULTS
 SNAP_SIZE='1G'
-SNAP_SUFFIX='_rsync_snap'
-SNAP_MNT='/mnt/'
+SNAP_SUFFIX='_atomic_rsync'
+TARGET_ROOT='/mnt/'
 DEBUG=false
-DEBUG_LOG="/tmp/rsync-lvm-snapshot-$$.log"
-# END CONFIGURATION
+DEBUG_LOG="/tmp/atomic-rsync-$$.log"
+# END DEFAULTS
 
+# source local configuration first from local dir then try etc
+if [ -f ./atomic.conf ]; then
+    . ./atomic.conf
+elif [ -f /etc/atomic.conf ]; then
+    . /etc/atomic.conf
+fi
+
+#
+# Functions
+#
+
+function mountsInPath() {
+    # Return all potential ext(2,3,4) mounts in the path $1
+    cat /proc/mounts | egrep ' ext(2|3|4)' | awk '{ print $2","$1 }' | grep ^${1} | sort
+}
 
 function getLVMDevice() {
     # $1 = '/home' returns /dev/vg_sys/lv_home
@@ -45,6 +61,7 @@ function getLVMDevice() {
 }
 
 function isLVM() {
+    # is device $1 LVM
     CMD=`getLVMDevice ${1}`
     if [ "$CMD" == "" ]; then
         # is not LVM
@@ -55,42 +72,41 @@ function isLVM() {
     fi
 }
 
-function lvmCleanup() {
+function atomicRsync() {
+    # Mount all lvms in the backup path in a new root and point rsync root there
     
-    # post
-    cd / && \
-    umount ${SNAP_MNT} && \
-    lvremove -f ${SNAP_LV} 1> /dev/null && \
-    rmdir ${SNAP_MNT}
+    for m in $(mountsInPath ${1}); do
+
+        SRC_MOUNT=$(echo $m | sed -e 's@,@ @g' | awk '{ print $1 }')
+        SRC_DEVICE=$(echo $m | sed -e 's@,@ @g' | awk '{ print $2 }')
+        TARGET_MNT=${TARGET_ROOT}${SRC_MOUNT}
+        
+        if [ -d ${TARGET_MNT} ]; then
+            mkdir -p ${TARGET_MNT}
+            trap $(rmdir ${TARGET_MNT}) EXIT
+        fi
     
-}
-
-function lvmBackup() {
-
-    trap lvmCleanup EXIT
+        if isLVM $SRC_MOUNT; then
+            # is lvm snapshot the device and mount in our root
+            SRC_LV_DEVICE=${SRC_DEVICE}
+            SNAP_LV_DEVICE=${SRC_LV_DEVICE}${SNAP_SUFFIX}
+            SNAP_NAME=$(basename ${SRC_LV_DEVICE})${SNAP_SUFFIX}
+            
+            trap $(umount ${TARGET_MNT} && lvremove -f ${SNAP_LV_DEVICE} && rmdir ${TARGET_MNT}) EXIT # unmount automatically on function exit
+            
+            sync && \
+            lvcreate -s ${SRC_LV_DEVICE} -n ${SNAP_NAME} -L ${SNAP_SIZE} 1> /dev/null
+            mount -o ro ${SNAP_LV_DEVICE} ${TARGET_MNT}
+        else
+            # is not LVM, just perform a bind mount
+            trap $(umount ${TARGET_MNT}) EXIT # No need to remove bind dir
+            mount -o bind ${SRC_MOUNT} ${TARGET_MNT}
+        fi
+            
+    done
     
-    SRC_LV=`getLVMDevice ${BACKUPPATH}`
-    SRC_NAME=`basename ${SRC_LV}`
-    SNAP_LV="${SRC_LV}${SNAP_SUFFIX}"
-    SNAP_NAME="${SRC_NAME}${SNAP_SUFFIX}"
-    SNAP_MNT="${SNAP_MNT}${SNAP_NAME}"
-
     RSYNC_ARGS="`echo ${RSYNC_ARGS} | sed 's@[ ][^ ]*$@@'` ./" # replace last argument with relative path
-
-    # Pre
-    sync && \
-    lvcreate -s ${SRC_LV} -n ${SNAP_NAME} -L ${SNAP_SIZE} 1> /dev/null && \
-    mkdir -p ${SNAP_MNT} && \
-    mount -o ro ${SNAP_LV} ${SNAP_MNT}
-
-    # backup
-    cd ${SNAP_MNT} && \
-    /usr/bin/rsync ${RSYNC_ARGS}
-
-}
-
-function regularBackup() {
-    # backup
+    cd ${TARGET_ROOT} && \
     /usr/bin/rsync ${RSYNC_ARGS}
 }
 
@@ -98,19 +114,11 @@ function regularBackup() {
 # Main code here
 #
 
+RSYNC_ARGS=`shift; echo "$@"`
+RSYNC_PATH=`echo "${RSYNC_ARGS}" | sed 's/.* //'` # last argument
+
 if ${DEBUG}; then
     echo "Started with args: $RSYNC_ARGS" >> $DEBUG_LOG
 fi
 
-T=`isLVM "$BACKUPPATH"`
-if [ "$?" -eq "0" ]; then
-    if ${DEBUG}; then
-        echo "Performing an LVM backup: ${T}" >> $DEBUG_LOG
-    fi
-    lvmBackup
-else
-    if ${DEBUG}; then
-        echo "Performing a regular backup: ${T}" >> $DEBUG_LOG
-    fi
-    regularBackup
-fi
+atomicRsync $RSYNC_PATH
